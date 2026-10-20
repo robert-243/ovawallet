@@ -5,22 +5,23 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const app = express();
 app.use(express.json());
 
-// Gestion sécurisée du proxy Fixie
+// Configuration du proxy Fixie
 const fixieUrl = process.env.FIXIE_URL ? process.env.FIXIE_URL.trim() : null;
 let httpsAgent = null;
 
 if (fixieUrl) {
   try {
     httpsAgent = new HttpsProxyAgent(fixieUrl);
-    console.log('Proxy Fixie configuré avec succès');
+    console.log('Proxy Fixie actif');
   } catch (err) {
-    console.error('Erreur lors de la configuration de FIXIE_URL:', err.message);
+    console.error('Erreur Fixie:', err.message);
   }
 }
 
+// Endpoint pour le Checkout SasPay
 app.post('/pay', async (req, res) => {
   try {
-    const response = await axios.post('https://api.saspay.net/v1/payments', req.body, {
+    const response = await axios.post('https://api.saspay.me/api/v1/checkout-sessions/', req.body, {
       httpsAgent,
       httpAgent: httpsAgent,
       headers: {
@@ -35,10 +36,8 @@ app.post('/pay', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('Proxy OVAWALLET - Fixie actif');
+  res.send('Proxy OVAWALLET - Relay actif');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log('Proxy relais actif sur le port ' + PORT);
-});
+app.listen(PORT, () => console.log('Serveur démarré sur le port ' + PORT));
