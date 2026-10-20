@@ -5,8 +5,18 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 const app = express();
 app.use(express.json());
 
-const fixieUrl = process.env.FIXIE_URL;
-const httpsAgent = fixieUrl ? new HttpsProxyAgent(fixieUrl) : null;
+// Gestion sécurisée du proxy Fixie
+const fixieUrl = process.env.FIXIE_URL ? process.env.FIXIE_URL.trim() : null;
+let httpsAgent = null;
+
+if (fixieUrl) {
+  try {
+    httpsAgent = new HttpsProxyAgent(fixieUrl);
+    console.log('Proxy Fixie configuré avec succès');
+  } catch (err) {
+    console.error('Erreur lors de la configuration de FIXIE_URL:', err.message);
+  }
+}
 
 app.post('/pay', async (req, res) => {
   try {
