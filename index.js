@@ -9,19 +9,33 @@ app.use(express.json());
 let rawFixie = process.env.FIXIE_URL || '';
 let cleanFixie = rawFixie.replace(/[\[\]'"\s]/g, '');
 
-// Configuration de l'agent proxy en mode Tunnel CONNECT HTTPS
 let httpsAgent = null;
-
 if (cleanFixie) {
   try {
-    // URL exacte de destination pour forcer le tunnel SSL vers SasPay
     httpsAgent = new HttpsProxyAgent(cleanFixie);
+    console.log('Proxy Fixie initialisé.');
   } catch (err) {
     console.error('Erreur Fixie:', err.message);
   }
 }
 
-// Endpoint pour SasPay Checkout
+// Helper pour préparer les headers de transmission
+const getHeaders = (req) => {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+  
+  // Transmettre l'en-tête Authorization s'il est présent
+  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
+  if (authHeader) {
+    headers['Authorization'] = authHeader;
+  }
+  
+  return headers;
+};
+
+// 1. Endpoint pour les DÉPÔTS (Checkout Sessions)
 app.post('/pay', async (req, res) => {
   try {
     const response = await axios({
@@ -29,11 +43,25 @@ app.post('/pay', async (req, res) => {
       url: 'https://api.saspay.me/api/v1/checkout-sessions/',
       data: req.body,
       httpsAgent: httpsAgent,
-      proxy: false, // Force axios à utiliser l'httpsAgent (tunnel CONNECT)
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json'
-      }
+      proxy: false,
+      headers: getHeaders(req)
+    });
+    res.status(response.status).json(response.data);
+  } catch (error) {
+    res.status(error.response?.status || 500).json(error.response?.data || { error: error.message });
+  }
+});
+
+// 2. Endpoint pour les RETRAITS (Payouts)
+app.post('/payout', async (req, res) => {
+  try {
+    const response = await axios({
+      method: 'post',
+      url: 'https://api.saspay.me/api/v1/payouts/',
+      data: req.body,
+      httpsAgent: httpsAgent,
+      proxy: false,
+      headers: getHeaders(req)
     });
     res.status(response.status).json(response.data);
   } catch (error) {
@@ -42,8 +70,8 @@ app.post('/pay', async (req, res) => {
 });
 
 app.get('/', (req, res) => {
-  res.send('Proxy OVAWALLET - Relay actif');
+  res.send('Proxy OVAWALLET - Relay actif (Pay & Payout)');
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Serveur proxy actif sur le port ' + PORT));
+app.listen(PORT, () => console.log('Serveur proxy actif sur ' + PORT));
