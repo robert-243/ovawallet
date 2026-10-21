@@ -1,113 +1,148 @@
+'use strict';
+
 const express = require('express');
 const axios = require('axios');
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const app = express();
-app.use(express.json());
+const SASPAY = 'https://api.saspay.me/api/v1';
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Extraction et nettoyage de l'URL Fixie
-let rawFixie = process.env.FIXIE_URL || '';
-let cleanFixie = rawFixie.replace(/[\[\]'"\s]/g, '');
+const fixieUrl = (process.env.FIXIE_URL || '')
+  .trim()
+  .replace(/^[\[\]'"\s]+|[\[\]'"\s]+$/g, '');
 
 let httpsAgent = null;
-if (cleanFixie) {
+
+if (fixieUrl) {
   try {
-    httpsAgent = new HttpsProxyAgent(cleanFixie);
-    console.log('Proxy Fixie initialisé.');
-  } catch (err) {
-    console.error('Erreur Fixie:', err.message);
+    const parsed = new URL(fixieUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      throw new Error('invalid protocol');
+    }
+    httpsAgent = new HttpsProxyAgent(fixieUrl);
+  } catch {
+    console.error('Configuration Fixie invalide : vérifier FIXIE_URL dans Render.');
   }
 }
 
-// Helper pour préparer les headers de transmission
-const getHeaders = (req) => {
-  const headers = {
+app.disable('x-powered-by');
+app.use(express.json({
+  limit: '256kb',
+  verify: (req, _res, buffer) => {
+    req.rawBody = Buffer.from(buffer);
+  },
+}));
+
+function getHeaders(req) {
+  return {
+    Authorization: req.headers.authorization,
+    Accept: 'application/json',
     'Content-Type': 'application/json',
-    'Accept': 'application/json'
+    ...(req.headers['idempotency-key']
+      ? { 'Idempotency-Key': req.headers['idempotency-key'] }
+      : {}),
   };
-  
-  // Transmettre l'en-tête Authorization s'il est présent
-  const authHeader = req.headers['authorization'] || req.headers['Authorization'];
-  if (authHeader) {
-    headers['Authorization'] = authHeader;
-  }
-  
-  return headers;
-};
-
-// 1. Endpoint pour les DÉPÔTS (Checkout Sessions)
-app.post('/pay', async (req, res) => {
-  try {
-    const response = await axios({
-      method: 'post',
-      url: 'https://api.saspay.me/api/v1/checkout-sessions/',
-      data: req.body,
-      httpsAgent: httpsAgent,
-      proxy: false,
-      headers: getHeaders(req)
-    });
-    res.status(response.status).json(response.data);
-  } catch (error) {
-    res.status(error.response?.status || 500).json(error.response?.data || { error: error.message });
-  }
-});
-
-// 2. Endpoint pour les RETRAITS (Payouts)
-app.post('/payout', async (req, res) => {
-  try {
-    const response = await axios({
-      method: 'post',
-      url: 'https://api.saspay.me/api/v1/payouts/',
-      data: req.body,
-      httpsAgent: httpsAgent,
-      proxy: false,
-      headers: getHeaders(req)
-    });
-    res.status(response.status).json(response.data);
-  } catch (error) {
-    res.status(error.response?.status || 500).json(error.response?.data || { error: error.message });
-  }
-});
-
-app.get('/', (req, res) => {
-  res.send('Proxy OVAWALLET - Relay actif (Pay & Payout)');
-  // Dans le serveur Express du relais Render (à côté de la route /pay existante)
-const { HttpsProxyAgent } = require("https-proxy-agent");
-const agent = new HttpsProxyAgent(process.env.FIXIE_URL); // déjà utilisé pour /pay
-const SASPAY = "https://api.saspay.me/api/v1";
+}
 
 async function forward(req, res, method, path) {
   const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith("Bearer sk_")) return res.status(401).json({ error: "missing key" });
+
+  if (typeof auth !== 'string' || !auth.startsWith('Bearer sk_')) {
+    return res.status(401).json({ error: 'missing key' });
+  }
+
+  // Ne jamais contourner Fixie ni désactiver la validation TLS.
+  if (!httpsAgent) {
+    return res.status(503).json({ error: 'Fixie is not configured' });
+  }
+
   try {
-    const r = await fetch(`${SASPAY}${path}`, {
+    const response = await axios({
       method,
-      headers: { Authorization: auth, Accept: "application/json", ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
-      body: method === "POST" ? JSON.stringify(req.body) : undefined,
-      dispatcher: agent, // ou `agent` selon votre client HTTP (axios: httpsAgent: agent)
-      redirect: "manual",
+      url: `${SASPAY}${path}`,
+      ...(method === 'POST'
+        ? { data: req.rawBody || JSON.stringify(req.body) }
+        : {}),
+      httpsAgent,
+      proxy: false,
+      headers: getHeaders(req),
+      timeout: 60000,
+      maxRedirects: 0,
+      validateStatus: () => true,
+      responseType: 'arraybuffer',
+      // Aucun renvoi automatique des demandes de paiement.
     });
-    res.status(r.status).type("application/json").send(await r.text());
-  } catch (e) {
-    res.status(502).json({ error: "relay upstream error" });
+
+    if (response.status >= 300 && response.status < 400) {
+      return res.status(502).json({
+        error: 'upstream redirect blocked; outcome unconfirmed',
+      });
+    }
+
+    res.status(response.status);
+    const contentType = response.headers?.['content-type'];
+    if (contentType) res.set('Content-Type', contentType);
+    return res.send(Buffer.from(response.data));
+  } catch (error) {
+    const timeout = error.code === 'ECONNABORTED'
+      || error.code === 'ETIMEDOUT';
+
+    console.error(
+      `Relais : ${timeout ? 'délai dépassé' : 'connexion amont impossible'} ; ne pas renvoyer automatiquement.`
+    );
+
+    return res.status(timeout ? 504 : 502).json({
+      error: timeout
+        ? 'upstream timeout; outcome unconfirmed'
+        : 'upstream connection failed; outcome unconfirmed',
+    });
   }
 }
 
-// Envoi d'un retrait (jamais relancé automatiquement)
-app.post("/payouts", (req, res) => forward(req, res, "POST", "/payouts/initialize/"));
+// DÉPÔTS : adresse existante conservée.
+app.post('/pay', (req, res) =>
+  forward(req, res, 'POST', '/checkout-sessions/')
+);
 
-// Vérification du statut d'un retrait
-app.get("/payouts/:id/verify", (req, res) => {
-  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) return res.status(400).json({ error: "bad id" });
-  forward(req, res, "GET", `/payouts/${req.params.id}/verify/`);
+// RETRAITS : route utilisée par OVAFAST.
+app.post('/payouts', (req, res) =>
+  forward(req, res, 'POST', '/payouts/initialize/')
+);
+
+// Compatibilité avec l'ancienne adresse au singulier.
+app.post('/payout', (req, res) =>
+  forward(req, res, 'POST', '/payouts/initialize/')
+);
+
+// Vérification des retraits.
+app.get('/payouts/:id/verify', (req, res) => {
+  if (!UUID.test(req.params.id)) {
+    return res.status(400).json({ error: 'bad id' });
+  }
+  return forward(req, res, 'GET', `/payouts/${req.params.id}/verify/`);
 });
 
-// Vérification d'un dépôt (pour confirmer automatiquement les dépôts)
-app.get("/payments/:id/verify", (req, res) => {
-  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) return res.status(400).json({ error: "bad id" });
-  forward(req, res, "GET", `/payments/${req.params.id}/verify/`);
+// Vérification des dépôts.
+app.get('/payments/:id/verify', (req, res) => {
+  if (!UUID.test(req.params.id)) {
+    return res.status(400).json({ error: 'bad id' });
+  }
+  return forward(req, res, 'GET', `/payments/${req.params.id}/verify/`);
 });
+
+app.get('/', (_req, res) => {
+  res.send('OVAFAST — relais actif (dépôts et retraits)');
+});
+
+app.use((error, _req, res, _next) => {
+  const status = error.type === 'entity.too.large' ? 413 : 400;
+  res.status(status).json({
+    error: status === 413 ? 'request too large' : 'invalid JSON',
+  });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Serveur proxy actif sur ' + PORT));
+app.listen(PORT, () => {
+  console.log(`Relais OVAFAST actif sur ${PORT}`);
+});
