@@ -71,6 +71,42 @@ app.post('/payout', async (req, res) => {
 
 app.get('/', (req, res) => {
   res.send('Proxy OVAWALLET - Relay actif (Pay & Payout)');
+  // Dans le serveur Express du relais Render (à côté de la route /pay existante)
+const { HttpsProxyAgent } = require("https-proxy-agent");
+const agent = new HttpsProxyAgent(process.env.FIXIE_URL); // déjà utilisé pour /pay
+const SASPAY = "https://api.saspay.me/api/v1";
+
+async function forward(req, res, method, path) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith("Bearer sk_")) return res.status(401).json({ error: "missing key" });
+  try {
+    const r = await fetch(`${SASPAY}${path}`, {
+      method,
+      headers: { Authorization: auth, Accept: "application/json", ...(method === "POST" ? { "Content-Type": "application/json" } : {}) },
+      body: method === "POST" ? JSON.stringify(req.body) : undefined,
+      dispatcher: agent, // ou `agent` selon votre client HTTP (axios: httpsAgent: agent)
+      redirect: "manual",
+    });
+    res.status(r.status).type("application/json").send(await r.text());
+  } catch (e) {
+    res.status(502).json({ error: "relay upstream error" });
+  }
+}
+
+// Envoi d'un retrait (jamais relancé automatiquement)
+app.post("/payouts", (req, res) => forward(req, res, "POST", "/payouts/initialize/"));
+
+// Vérification du statut d'un retrait
+app.get("/payouts/:id/verify", (req, res) => {
+  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) return res.status(400).json({ error: "bad id" });
+  forward(req, res, "GET", `/payouts/${req.params.id}/verify/`);
+});
+
+// Vérification d'un dépôt (pour confirmer automatiquement les dépôts)
+app.get("/payments/:id/verify", (req, res) => {
+  if (!/^[0-9a-f-]{36}$/.test(req.params.id)) return res.status(400).json({ error: "bad id" });
+  forward(req, res, "GET", `/payments/${req.params.id}/verify/`);
+});
 });
 
 const PORT = process.env.PORT || 3000;
